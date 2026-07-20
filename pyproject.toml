@@ -1,0 +1,45 @@
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
+
+[project]
+name = "fibersail-edge"
+version = "0.1.0"
+description = "Edge sensor processing & cloud sync — synthetic vibration sensor, streaming processor, S3 sync."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Tiago Portela" }]
+
+# Core runtime deps are intentionally minimal. The edge path (Part 1 sensor +
+# Part 2 processor) must run within a bounded, predictable footprint on
+# constrained hardware, so it depends only on numpy. Everything used purely for
+# analysis / visualization lives in the optional [viz] extra below.
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Analysis & notebook tooling — NOT part of the edge runtime. A feature extra so
+# consumers can opt in:  uv sync --extra viz   (or  pip install ".[viz]").
+viz = [
+    "scipy>=1.10",      # signal.welch (PSD) for spectral analysis
+    "matplotlib>=3.7",  # plots in the exploration notebook
+    "pandas>=2.0",      # convenient CSV/data handling in the notebook
+    "jupyter>=1.0",     # run the exploration notebook
+    "nbformat>=5.0",    # programmatic notebook construction
+    "nbconvert>=7.0",   # execute the notebook headlessly
+]
+
+# Dev-only tooling (PEP 735). uv installs the default groups automatically on
+# `uv sync`; not published as package metadata.
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# src layout: make `import fibersail_edge` resolve even without an install
+# (uv sync installs it editable into .venv; this covers bare `pytest` too).
+pythonpath = ["src"]
