@@ -2,9 +2,9 @@
 
 A small, realistic slice of an industrial equipment-health pipeline: a synthetic
 vibration sensor (physics) → a streaming edge processor → a durable cloud sync
-layer. This repository currently implements **Part 1 — the simulated sensor**,
-structured so Parts 2 (edge processing) and 3 (cloud sync) drop in on top of it
-without rework.
+layer. This repository implements **Part 1 — the simulated sensor** and **Part 2
+— the edge processing service**, structured so Part 3 (cloud sync) drops in on top
+of them without rework.
 
 > Full brief: [`take_home_exercise/take_home_exercise.md`](take_home_exercise/take_home_exercise.md).
 
@@ -15,7 +15,7 @@ without rework.
 | Part | Scope | Status |
 |------|-------|--------|
 | **1** | Simulated sensor — damped harmonic oscillator, streamed, injectable fault | ✅ implemented |
-| 2 | Edge processing — bounded rolling window, RMS/std/dominant-freq, anomaly detection | ⏳ next |
+| **2** | Edge processing — bounded ring buffer, RMS/std/dominant-freq, anomaly detection, ≥1 kHz | ✅ implemented |
 | 3 | Cloud sync — batch + compress, durable file queue, LocalStack S3, backoff | ⏳ next |
 
 ---
@@ -24,14 +24,24 @@ without rework.
 
 ```
 src/fibersail_edge/
-  sources.py     # Sample, SampleSource protocol, CsvReplaySource
-  sensor.py      # SensorConfig, FaultConfig, DampedOscillatorSensor (RK4 integrator)
-  py.typed       # PEP 561 typing marker
+  sources.py       # Sample, SampleSource protocol, CsvReplaySource        (Part 1)
+  sensor.py        # SensorConfig, FaultConfig, DampedOscillatorSensor      (Part 1)
+  ring_buffer.py   # RingBuffer — preallocated numpy circular buffer        (Part 2)
+  features.py      # FeatureFrame, FeatureExtractor (RMS/std/dominant freq) (Part 2)
+  detector.py      # Detector protocol, BaselineZScoreDetector              (Part 2)
+  sink.py          # FrameSink seam (ListSink/CallbackSink) → Part 3        (Part 2)
+  processor.py     # ProcessorConfig, EdgeProcessor (ties it together)      (Part 2)
+  evaluation.py    # precision/recall, guard-band + latency, evaluate()     (Part 2)
+  benchmark.py     # throughput harness   (python -m fibersail_edge.benchmark)
+  __main__.py      # end-to-end demo + eval (python -m fibersail_edge)
+  py.typed         # PEP 561 typing marker
 tests/
-  test_sensor.py # physics, streaming, fault detectability, reproducibility, memory
-  test_sources.py# CSV replay parsing + interface conformance
+  test_sensor.py / test_sources.py                 # Part 1
+  test_ring_buffer.py test_features.py test_detector.py test_processor.py
+  test_evaluation.py test_throughput.py test_sink.py   # Part 2
 notebooks/
-  01_sensor_exploration.ipynb   # visualization + consistency checks (pre-executed)
+  01_sensor_exploration.ipynb   # Part 1 — signal viz + consistency (pre-executed)
+  02_edge_processing.ipynb      # Part 2 — features, detection, throughput (pre-executed)
 take_home_exercise/             # the provided brief + sample_dataset_small.csv
 pyproject.toml                  # PEP 621 project; uv_build backend; viz extra + dev group
 uv.lock                         # pinned, reproducible resolution (committed)
@@ -96,15 +106,34 @@ Run the code and tests through the uv environment (`uv run <cmd>` executes insid
 
 ```bash
 uv run python -c "import fibersail_edge; print(fibersail_edge.__version__)"
-uv run pytest                # 20 tests, ~1 s
+uv run pytest                       # 66 tests, ~6 s
+uv run python -m fibersail_edge     # Part 2: run the pipeline + print the eval summary
+uv run python -m fibersail_edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
 ```
 
-Open / re-run the exploration notebook (already executed with outputs saved):
+Feed the sensor stream through the edge processor and read off feature frames:
+
+```python
+from fibersail_edge import DampedOscillatorSensor, SensorConfig, FaultConfig, EdgeProcessor, evaluate
+
+sensor = DampedOscillatorSensor(SensorConfig(
+    duration_s=15.0, seed=42,
+    fault=FaultConfig(start_s=7.0, duration_s=3.0, omega_n_factor=0.7, zeta_factor=0.4),
+))
+processor = EdgeProcessor.for_source(sensor)          # sizes the window from the source rate
+
+for frame in processor.process_stream(sensor):
+    print(frame.t, frame.rms, frame.dominant_freq_hz, frame.is_anomaly)
+
+print(evaluate(sensor, processor).format_summary())   # precision/recall vs the fault window
+```
+
+Open / re-run the exploration notebooks (already executed with outputs saved):
 
 ```bash
-uv run jupyter notebook notebooks/01_sensor_exploration.ipynb
+uv run jupyter notebook notebooks/02_edge_processing.ipynb
 # or headless:
-uv run jupyter nbconvert --to notebook --execute --inplace notebooks/01_sensor_exploration.ipynb
+uv run jupyter nbconvert --to notebook --execute --inplace notebooks/02_edge_processing.ipynb
 ```
 
 ---
@@ -185,6 +214,140 @@ sampling) over a long run and confirm a flat curve.
 
 ---
 
+## Part 2 — Edge processing service
+
+A streaming processor that consumes any `SampleSource` in (simulated) real time,
+maintains a bounded rolling window, computes rolling health features with **no
+look-ahead**, flags anomalies, and emits compact **feature frames** for Part 3 —
+without ever blocking on the cloud.
+
+```
+Sample ─▶ RingBuffer (trailing window) ─▶ FeatureExtractor ─▶ Detector ─▶ FeatureFrame ─▶ FrameSink ─▶ (Part 3)
+          bounded, O(1)/sample            RMS/mean/std/FFT     z-score      10 Hz, w/ flag   non-blocking
+```
+
+The per-sample hot path is just a ring-buffer push; the expensive work (one FFT +
+a few reductions) runs only once per **hop** (default every 0.1 s → 10 frames/s).
+
+### Bounded rolling window — a preallocated ring buffer
+
+`RingBuffer` writes into a single `np.empty(capacity)` allocated once at
+construction and never again. Chosen over `collections.deque(maxlen=N)` because:
+
+- **Vectorized features for free.** `snapshot()` returns a contiguous `float64`
+  array, so `np.fft.rfft` and the reductions run as pure C — a deque of boxed
+  Python floats would need an O(N) copy-and-unbox every hop.
+- **Provably bounded memory.** No allocation after construction, so a test can
+  push 10k vs. 1M samples through the same buffer and see an essentially identical
+  peak (`tests/test_ring_buffer.py::test_memory_is_bounded`).
+
+### Rolling features (RMS, mean, std, dominant frequency)
+
+- **Causal / no look-ahead.** The window is *trailing* — `[t − window_s, t]` — and
+  the frame timestamp is the newest sample's time. Nothing is emitted until the
+  buffer first fills (a ~`window_s` silent start, well before any fault).
+- **Recompute per hop, don't accumulate.** Stats are recomputed from the snapshot
+  with numpy's pairwise-summation `mean`/`std`. The O(1) running-sum alternative
+  suffers **catastrophic cancellation** on a DC-heavy signal (the CSV strain sits
+  near 1500, so `E[x²] ≈ E[x]²`) and drifts on an infinite stream; recompute is
+  both more robust and, at 10 Hz over a ~1500-sample window, negligibly cheap.
+- **Detrend before the FFT.** The window mean is subtracted before the Hann taper,
+  so a DC offset can't dominate the peak search (critical for the CSV source).
+- **Resolution.** Δf = fs/N ≈ 0.67 Hz at 1.5 s / 1 kHz, so the 50→35 Hz fault
+  shift spans ~22 bins — resolved with wide margin. An optional parabolic sub-bin
+  refinement sharpens the peak estimate.
+- **10 Hz telemetry.** Each frame carries the newest raw sample; the frame stream
+  *is* the ~10 Hz decimated telemetry Part 3 uploads. This is **point** decimation
+  (not anti-aliased) — acceptable because spectral content is already summarized by
+  `dominant_freq_hz`; `scipy.signal.decimate` is the "with more time" upgrade.
+
+### Anomaly detection — a self-calibrating baseline z-score detector
+
+Streaming and O(1) in memory (a handful of scalars). It learns a healthy baseline
+over the first `calibration_frames` (~3 s) via **Welford's** online algorithm, then
+flags a frame when *either* monitored feature deviates beyond `k = 4σ`:
+
+- **`dominant_freq_hz` is the primary signature** — the fault is a spectral step
+  (amplitude-invariant, so robust to benign gain/load changes). **`rms` is
+  secondary** (damping drops → the resonance rings harder). `mean`/`std` are
+  dropped as uninformative/redundant on the AC channel.
+- A two-counter **Schmitt-trigger debounce** (fire after 3 consecutive deviating
+  frames, clear after 5 calm ones) trades a little onset latency for far fewer
+  false positives, and standard-deviation **floors** stop a near-constant baseline
+  (especially a single-bin FFT peak) from producing spurious flags.
+- **Honesty on the threshold.** Overlapping windows make consecutive frames heavily
+  autocorrelated — *not* IID — so `k` is chosen a priori (a control-chart value),
+  **not** justified from Gaussian tails, and the false-positive rate is validated
+  empirically on a healthy stream (`test_no_anomalies_on_healthy_stream`).
+
+`Detector` is a `Protocol`, so an EWMA/Kalman alternative drops in without touching
+the processor (see "What I'd change").
+
+### Honest precision / recall against the ground-truth fault
+
+`evaluate()` scores the detector in one streaming O(1) pass and reports **four
+complementary views** — never just the flattering one — because a *causal* window
+creates two unavoidable boundary artifacts: onset lag (the window is still healthy
+right after the fault starts → false negatives) and trailing lag (the window is
+still faulty right after it ends → false positives).
+
+`python -m fibersail_edge` on the default fault (50→35 Hz, 7–10 s) prints:
+
+```
+  event detected : YES
+  detect latency : 0.90 s (reference ≈ 1.05 s)
+
+  raw (point labels — pessimistic floor):
+    precision= 0.647  recall= 0.733  F1= 0.688  FPR= 0.113
+  windowed (majority-faulty, ±0.75 s guard):
+    precision= 0.853  recall= 0.967  F1= 0.906  FPR= 0.047
+```
+
+1. **Raw** frame-level metrics (point labels) — the pessimistic, honest floor.
+2. **Windowed** metrics — a frame is faulty iff its trailing window is *majority*
+   faulty. This is a first-principles guard band of `window_s/2`, **printed and
+   derived** — not a hand-tuned fudge. (The rejected alternative, silently shifting
+   labels by `window_s/2` to "align" with the lag, is disguised tuning.)
+3. **Detection latency** vs. a derived reference (`window_s/2` + debounce). Here
+   0.90 s beats the 1.05 s reference — a strong frequency drop trips the threshold
+   before the window is even majority-faulty.
+4. **Event detected** — the operational "did we catch it at all".
+
+### Throughput — ≥1000 samples/s single-core
+
+The per-sample cost is one ring-buffer write; the FFT runs only 10×/s. Measured on
+a laptop (`python -m fibersail_edge.benchmark`, single core):
+
+| measurement | samples/s | × real-time |
+|-------------|-----------|-------------|
+| processing only (isolated) | ~420,000 | ~420× |
+| end-to-end (sensor + processing) | ~137,000 | ~137× |
+
+That is ~400× the 1 kHz bar — the loop demonstrably never falls behind.
+`tests/test_throughput.py -s` prints and asserts it.
+
+### Bounded-memory footprint (and how to verify)
+
+Everything is fixed-size regardless of stream length: the ring buffer (1.5 s @
+1 kHz = 1500 × 8 B ≈ **12 KB**) + the cached Hann window and `rfftfreq` table
+(~12 KB each) + bounded FFT scratch + the detector's handful of scalars — **well
+under 100 KB**, constant forever. Verified with `tracemalloc` in
+`tests/test_processor.py::test_bounded_memory_over_long_run` (peak flat across a
+10× longer run); on constrained hardware you'd confirm the same flat curve (or RSS)
+over a long soak.
+
+### Decoupling from Part 3 — the `FrameSink` seam
+
+A lazy iterator alone does **not** decouple: a consumer doing blocking S3 I/O just
+relocates the stall upstream. So Part 2 defines the non-blocking contract
+(`FrameSink.emit` must be O(1)) and ships in-memory doubles (`ListSink`,
+`CallbackSink`); `EdgeProcessor.run(source, sink)` drives it. The processor imports
+**nothing** from the cloud layer — dependency flow is one-way, so Part 3's durable,
+file-queue-backed, thread-safe sink drops in behind this interface and the edge
+loop can never block on S3.
+
+---
+
 ## Key design decisions & trade-offs
 
 - **One streaming contract, many sources.** `SampleSource` (a `Protocol`) is the
@@ -199,6 +362,11 @@ sampling) over a long run and confirm a flat curve.
   "optimal" stochastic integrator. Documented as an assumption above.
 - **Ground truth kept out of the stream** — a deliberate correctness boundary so
   the detector evaluation in Part 2 is honest.
+- **Decoupled cadence (Part 2).** Per-sample work is O(1) (a ring push); the FFT
+  runs only at the hop rate. This is what buys the ~400× throughput headroom while
+  keeping features causal.
+- **Pluggable detector behind a `Protocol`.** One baseline z-score detector ships;
+  the seam lets an EWMA/Kalman variant drop in without touching the processor.
 
 ## What I'd change with more time
 
@@ -207,21 +375,23 @@ sampling) over a long run and confirm a flat curve.
   linear system, useful at high `fs` or stiff parameters.
 - **Multi-channel emission** in one pass (accel + velocity + displacement, plus a
   temperature channel) to mirror the CSV schema more fully.
-- Property-based tests (Hypothesis) over parameter ranges; a small CLI
-  (`python -m fibersail_edge.generate ...`) to emit NDJSON/CSV for ad-hoc runs.
+- An **EWMA / Kalman detector** (with freeze-on-anomaly so a sustained fault can't
+  drag the adaptive baseline and mask itself) as a second `Detector`, and a
+  quantitative comparison against the baseline z-score version.
+- **Anti-aliased decimation** (`scipy.signal.decimate`) for the 10 Hz telemetry,
+  and a **PR curve** by sweeping the detector score threshold.
+- **Multi-sensor fusion** (2–3 correlated sensors) and property-based tests
+  (Hypothesis) over parameter ranges.
 
 ---
 
-## Roadmap — Parts 2 & 3
+## Roadmap — Part 3
 
-- **Part 2 (edge):** consume `SampleSource.stream()` through a bounded ring
-  buffer; compute rolling RMS / mean / std / dominant frequency (FFT) with no
-  look-ahead; threshold-detect anomalies and score precision/recall against
-  `fault_window`; benchmark ≥1000 samples/s single-core.
-- **Part 3 (cloud sync):** batch + compress windowed output; durable file-backed
-  queue that survives a process restart; LocalStack-mocked S3 with simulated
-  intermittent connectivity and retry-with-backoff; a justified S3 object layout.
-  Decoupled from the edge loop so it never blocks on S3 availability.
+- **Part 3 (cloud sync):** batch + compress the feature frames emitted through the
+  `FrameSink` seam; a durable file-backed queue that survives a process restart;
+  LocalStack-mocked S3 with simulated intermittent connectivity and
+  retry-with-backoff; a justified S3 object layout. A separate uploader thread
+  drains the sink so the edge loop never blocks on S3 availability.
 
 A "From prototype to production edge deployment" section (edge runtime/OTA/
 observability/sizing) will accompany the full submission.
