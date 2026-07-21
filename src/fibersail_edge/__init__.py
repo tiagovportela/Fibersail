@@ -23,9 +23,13 @@ from .edge import (
     EdgeProcessor,
     EvalResult,
     EvaluationReport,
+    EwmaConfig,
+    EwmaDetector,
     FeatureExtractor,
     FeatureFrame,
     FrameSink,
+    KalmanConfig,
+    KalmanDetector,
     ListSink,
     ProcessorConfig,
     RingBuffer,
@@ -52,6 +56,10 @@ __all__ = [
     "Detector",
     "DetectorConfig",
     "BaselineZScoreDetector",
+    "EwmaConfig",
+    "EwmaDetector",
+    "KalmanConfig",
+    "KalmanDetector",
     "FrameSink",
     "ListSink",
     "CallbackSink",
@@ -64,4 +72,4 @@ __all__ = [
     "evaluate",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

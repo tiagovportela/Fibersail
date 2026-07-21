@@ -15,6 +15,7 @@ The pipeline, in dependency order:
 
 from __future__ import annotations
 
+from .adaptive import EwmaConfig, EwmaDetector, KalmanConfig, KalmanDetector
 from .detector import BaselineZScoreDetector, Detector, DetectorConfig
 from .evaluation import (
     EvalResult,
@@ -35,6 +36,10 @@ __all__ = [
     "Detector",
     "DetectorConfig",
     "BaselineZScoreDetector",
+    "EwmaConfig",
+    "EwmaDetector",
+    "KalmanConfig",
+    "KalmanDetector",
     "FrameSink",
     "ListSink",
     "CallbackSink",

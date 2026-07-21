@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "fibersail-edge"
-version = "0.3.0"
+version = "0.4.0"
 description = "Edge sensor processing & cloud sync — synthetic vibration sensor, streaming processor, S3 sync."
 readme = "README.md"
 requires-python = ">=3.10"

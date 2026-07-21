@@ -33,8 +33,11 @@ independent Gaussian draws. ``k`` is therefore chosen a priori as a control-char
 style threshold, and the false-positive rate is validated empirically on a healthy
 stream — it is **not** justified from Gaussian tail probabilities.
 
-:class:`Detector` is a ``Protocol``, so an alternative (EWMA/Kalman, adaptive
-baseline) can be dropped in later without touching the processor.
+:class:`Detector` is a ``Protocol``, so an alternative drops in without touching the
+processor. Two adaptive-baseline alternatives — an EWMA control chart and a scalar
+Kalman filter — live in :mod:`~fibersail_edge.edge.adaptive` and share this module's
+:class:`_Debounce`, so :mod:`~fibersail_edge.edge.compare` can run all three head to
+head with only the baseline model differing.
 """
 
 from __future__ import annotations
@@ -134,6 +137,53 @@ class _Welford:
         return (self._m2 / self.n) ** 0.5
 
 
+class _Debounce:
+    """Two-counter Schmitt trigger over a stream of raw boolean verdicts.
+
+    Fires only after ``min_consecutive`` consecutive *deviating* frames and clears
+    only after ``clear_consecutive`` consecutive *calm* ones — hysteresis that
+    trades a little onset latency for far fewer false positives and no flapping.
+
+    Factored out of :class:`BaselineZScoreDetector` so every detector variant shares
+    the *identical* debounce; a head-to-head comparison then isolates the baseline
+    model, which is the only thing that differs. O(1) memory (two counters + a flag).
+    """
+
+    def __init__(self, min_consecutive: int, clear_consecutive: int) -> None:
+        self.min_consecutive = min_consecutive
+        self.clear_consecutive = clear_consecutive
+        self.reset()
+
+    def reset(self) -> None:
+        self._fired = False
+        self._on = 0
+        self._off = 0
+
+    @property
+    def fired(self) -> bool:
+        return self._fired
+
+    def update(self, raw_anomalous: bool) -> bool:
+        """Feed one raw verdict; return the debounced (stable) flag."""
+        if not self._fired:
+            if raw_anomalous:
+                self._on += 1
+                if self._on >= self.min_consecutive:
+                    self._fired = True
+                    self._off = 0
+            else:
+                self._on = 0
+        else:
+            if raw_anomalous:
+                self._off = 0
+            else:
+                self._off += 1
+                if self._off >= self.clear_consecutive:
+                    self._fired = False
+                    self._on = 0
+        return self._fired
+
+
 class BaselineZScoreDetector:
     """Baseline z-score detector with debounce. Implements :class:`Detector`.
 
@@ -156,18 +206,20 @@ class BaselineZScoreDetector:
     @property
     def is_calibrated(self) -> bool:
         """True once the baseline has been established."""
-        return self._state != CALIBRATING
+        return self._calibrated
 
     @property
     def state(self) -> str:
         """Current lifecycle state: ``calibrating`` / ``normal`` / ``anomalous``."""
-        return self._state
+        if not self._calibrated:
+            return CALIBRATING
+        return ANOMALOUS if self._debounce.fired else NORMAL
 
     def update(self, rms: float, dominant_freq_hz: float) -> Tuple[bool, float]:
         cfg = self.config
 
         # -- Calibration phase: learn the healthy baseline, never flag. --------
-        if self._state == CALIBRATING:
+        if not self._calibrated:
             self._rms_stats.add(rms)
             self._freq_stats.add(dominant_freq_hz)
             if self._rms_stats.n >= cfg.calibration_frames:
@@ -179,48 +231,36 @@ class BaselineZScoreDetector:
         z_freq = (dominant_freq_hz - self._freq_mean) / self._freq_std
         score = float(max(abs(z_rms), abs(z_freq)))
         raw_anomalous = abs(z_rms) > cfg.k or abs(z_freq) > cfg.k
-
-        # -- Debounce state machine (Schmitt trigger). -------------------------
-        if self._state == NORMAL:
-            if raw_anomalous:
-                self._on_count += 1
-                if self._on_count >= cfg.min_consecutive:
-                    self._state = ANOMALOUS
-                    self._off_count = 0
-            else:
-                self._on_count = 0
-        else:  # ANOMALOUS
-            if raw_anomalous:
-                self._off_count = 0
-            else:
-                self._off_count += 1
-                if self._off_count >= cfg.clear_consecutive:
-                    self._state = NORMAL
-                    self._on_count = 0
-
-        return (self._state == ANOMALOUS, score)
+        fired = self._debounce.update(raw_anomalous)
+        return (fired, score)
 
     def reset(self) -> None:
-        self._state = CALIBRATING
+        self._calibrated = False
         self._rms_stats = _Welford()
         self._freq_stats = _Welford()
         self._rms_mean = 0.0
         self._rms_std = 1.0
         self._freq_mean = 0.0
         self._freq_std = 1.0
-        self._on_count = 0
-        self._off_count = 0
+        self._debounce = _Debounce(self.config.min_consecutive, self.config.clear_consecutive)
 
     # -- Internals -------------------------------------------------------------
 
     def _finalize_baseline(self) -> None:
-        """Freeze the baseline mean/std (floored) and enter the NORMAL state."""
+        """Freeze the baseline mean/std (floored) and end calibration."""
         cfg = self.config
         self._rms_mean = self._rms_stats.mean
         self._rms_std = max(self._rms_stats.std, cfg.min_rms_std)
         self._freq_mean = self._freq_stats.mean
         self._freq_std = max(self._freq_stats.std, cfg.min_freq_std_hz)
-        self._state = NORMAL
+        self._calibrated = True
 
 
-__all__ = ["Detector", "DetectorConfig", "BaselineZScoreDetector", "CALIBRATING", "NORMAL", "ANOMALOUS"]
+__all__ = [
+    "Detector",
+    "DetectorConfig",
+    "BaselineZScoreDetector",
+    "CALIBRATING",
+    "NORMAL",
+    "ANOMALOUS",
+]
