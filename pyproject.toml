@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "fibersail-edge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Edge sensor processing & cloud sync — synthetic vibration sensor, streaming processor, S3 sync."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,11 +30,20 @@ viz = [
     "nbconvert>=7.0",   # execute the notebook headlessly
 ]
 
+# Cloud sync (Part 3) transport. boto3 is the ONLY new runtime dependency in the
+# whole cloud path and is intentionally opt-in: an edge build doing just Parts 1–2
+# (sense + process, or forward over a different transport) must not carry boto3 +
+# botocore. Enable with:  uv sync --extra cloud   (or  pip install ".[cloud]").
+cloud = [
+    "boto3>=1.34",      # AWS S3 client (works against moto/LocalStack/real S3 via endpoint_url)
+]
+
 # Dev-only tooling (PEP 735). uv installs the default groups automatically on
 # `uv sync`; not published as package metadata.
 [dependency-groups]
 dev = [
     "pytest>=7.0",
+    "moto[s3]>=5.0",    # in-process mock S3 for tests (pulls boto3 transitively → cloud tests run under `uv sync`)
 ]
 
 [tool.pytest.ini_options]
