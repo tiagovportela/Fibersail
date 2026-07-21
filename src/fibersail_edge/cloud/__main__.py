@@ -176,7 +176,10 @@ def main() -> None:
                 frames_emitted += 1
             sink.close(drain=True, timeout=30.0)
 
-            objects = list_batches(client, s3cfg.bucket, s3cfg.prefix)
+            # Verify against THIS run only: a persistent endpoint (LocalStack/AWS)
+            # accumulates objects across runs, so filter by our session id.
+            all_objects = list_batches(client, s3cfg.bucket, s3cfg.prefix)
+            objects = [(k, s) for k, s in all_objects if f"part-{sink.session_id}-" in k]
             frames_in_s3 = raw_bytes = gz_bytes = 0
             for key, _size in objects:
                 blob = read_batch(client, s3cfg.bucket, key)
@@ -189,7 +192,9 @@ def main() -> None:
             print()
             print(f"  simulated upload failures : {uploader.failures}")
             print(f"  batches enqueued / uploaded: {sink.enqueued_batches} / {sink.uploaded_batches}")
-            print(f"  objects in S3             : {len(objects)}")
+            if len(all_objects) != len(objects):
+                print(f"  objects in S3 (all runs)  : {len(all_objects)}")
+            print(f"  objects in S3 (this run)  : {len(objects)}")
             if objects:
                 print(f"  example key               : {objects[0][0]}")
             print(f"  frames emitted            : {frames_emitted}")
