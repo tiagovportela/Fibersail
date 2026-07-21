@@ -7,6 +7,7 @@ name = "fibersail-edge"
 version = "0.4.0"
 description = "Edge sensor processing & cloud sync — synthetic vibration sensor, streaming processor, S3 sync."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Tiago Portela" }]
 
@@ -44,7 +45,24 @@ cloud = [
 dev = [
     "pytest>=7.0",
     "moto[s3]>=5.0",    # in-process mock S3 for tests (pulls boto3 transitively → cloud tests run under `uv sync`)
+    "ruff>=0.8",        # lint + import ordering (CI-enforced)
+    "mypy>=1.13",       # type checking against the py.typed claim (CI-enforced)
 ]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Defaults (pyflakes + core pycodestyle) plus import ordering. pyupgrade is
+# deliberately NOT enabled: the codebase standardizes on classic typing generics.
+extend-select = ["I"]
+
+[tool.mypy]
+files = ["src"]
+# No python_version pin: numpy's stubs use 3.12+ syntax. 3.10 compatibility is
+# guaranteed by the CI test matrix (pytest on 3.10), not by the type checker.
+ignore_missing_imports = true   # boto3/moto ship no inline stubs
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -46,7 +46,7 @@ class RingBuffer:
     def __init__(self, capacity: int, *, dtype: type = float) -> None:
         if capacity <= 0:
             raise ValueError(f"capacity must be > 0, got {capacity}")
-        self._buf = np.empty(capacity, dtype=dtype)
+        self._buf: np.ndarray = np.empty(capacity, dtype=dtype)
         self._cursor = 0  # index the next push writes to
         self._count = 0  # number of valid values (<= capacity)
 

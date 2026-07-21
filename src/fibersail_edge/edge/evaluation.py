@@ -42,8 +42,8 @@ import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
-from .processor import EdgeProcessor
 from ..sources import SampleSource
+from .processor import EdgeProcessor
 
 
 class _Confusion:
@@ -218,7 +218,6 @@ def evaluate(
     guard_s = window_s * guard_frac
     fault_window = source.fault_window
     fault_start = fault_window[0] if fault_window is not None else None
-    fault_end = fault_window[1] if fault_window is not None else None
 
     raw = _Confusion()
     windowed = _Confusion()
@@ -234,12 +233,13 @@ def evaluate(
             point_label = False
             window_label = False
         else:
-            point_label = fault_start <= frame.t < fault_end
+            start_s, end_s = fault_window  # local unpack: non-Optional floats
+            point_label = start_s <= frame.t < end_s
             window_label = window_faulty_fraction(frame.t, window_s, fault_window) >= guard_frac
-            if pred and frame.t >= fault_start:
+            if pred and frame.t >= start_s:
                 if first_detection_t is None:
                     first_detection_t = frame.t
-                if frame.t < fault_end + window_s:
+                if frame.t < end_s + window_s:
                     event_detected = True
 
         raw.add(point_label, pred)

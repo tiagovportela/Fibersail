@@ -23,9 +23,9 @@ from fibersail_edge.cloud import (
     SinkConfig,
     build_object_key,
     deserialize_batch,
+    s3,
     serialize_batch,
 )
-from fibersail_edge.cloud import s3
 from fibersail_edge.cloud.s3 import S3Config, S3Uploader
 
 

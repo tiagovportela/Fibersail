@@ -48,8 +48,15 @@ class SampleSource(Protocol):
     device later).
     """
 
-    #: Nominal sampling rate in Hz. Downstream windowing/FFT code needs this.
-    sample_rate_hz: float
+    @property
+    def sample_rate_hz(self) -> float:
+        """Nominal sampling rate in Hz. Downstream windowing/FFT code needs this.
+
+        Declared as a read-only property (both implementations expose it that
+        way); a plain attribute here would demand a *settable* member and reject
+        read-only conformers under type checking.
+        """
+        ...
 
     def stream(self) -> Iterator[Sample]:
         """Yield samples lazily, one at a time, in time order."""

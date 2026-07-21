@@ -46,7 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from .detector import CALIBRATING, NORMAL, ANOMALOUS, _Debounce, _Welford
+from .detector import ANOMALOUS, CALIBRATING, NORMAL, _Debounce, _Welford
 
 
 def _ewma_step(mean: float, var: float, x: float, alpha: float) -> Tuple[float, float]:
@@ -117,6 +117,16 @@ class EwmaDetector:
         >>> det.is_calibrated
         True
     """
+
+    # Attribute types (state lives in reset() so the detector is reusable).
+    _calibrated: bool
+    _rms_stats: _Welford
+    _freq_stats: _Welford
+    _rms_mean: float
+    _rms_var: float
+    _freq_mean: float
+    _freq_var: float
+    _debounce: _Debounce
 
     def __init__(self, config: Optional[EwmaConfig] = None) -> None:
         self.config = config or EwmaConfig()
@@ -305,6 +315,7 @@ class KalmanDetector:
             return (False, 0.0)
 
         # -- Score with the normalized innovation of each filter. --------------
+        assert self._rms_kf is not None and self._freq_kf is not None  # set at calibration
         nu_rms = self._rms_kf.normalized_innovation(rms)
         nu_freq = self._freq_kf.normalized_innovation(dominant_freq_hz)
         score = float(max(abs(nu_rms), abs(nu_freq)))

@@ -28,11 +28,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
+from ..sources import Sample, SampleSource
 from .detector import BaselineZScoreDetector, Detector, DetectorConfig
 from .features import FeatureExtractor, FeatureFrame
 from .ring_buffer import RingBuffer
 from .sink import FrameSink
-from ..sources import Sample, SampleSource
 
 
 @dataclass(frozen=True)

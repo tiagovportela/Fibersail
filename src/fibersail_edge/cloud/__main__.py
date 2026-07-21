@@ -206,7 +206,7 @@ def main() -> None:
 
             if endpoint_url is not None:
                 print("\nObjects persist — browse them (dummy creds work for LocalStack):")
-                print(f"  export AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing")
+                print("  export AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing")
                 print(f"  aws --endpoint-url={endpoint_url} s3 ls s3://{args.bucket}/{args.prefix}/ --recursive")
                 if objects:
                     print(f"  aws --endpoint-url={endpoint_url} s3 cp "

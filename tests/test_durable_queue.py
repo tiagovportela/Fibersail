@@ -11,10 +11,9 @@ import tempfile
 
 import pytest
 
-from fibersail_edge.cloud import DurableQueue
-from fibersail_edge.cloud.serialization import build_object_key, read_header
-from fibersail_edge.cloud import BatchHeader, serialize_batch
 from fibersail_edge import FeatureFrame
+from fibersail_edge.cloud import BatchHeader, DurableQueue, serialize_batch
+from fibersail_edge.cloud.serialization import build_object_key, read_header
 
 
 def test_put_peek_ack_fifo_order() -> None:

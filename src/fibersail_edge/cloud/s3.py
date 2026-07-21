@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from .uploader import PermanentUploadError, TransientUploadError, Uploader
+from .uploader import PermanentUploadError, TransientUploadError
 
 try:  # boto3 is an optional (cloud) dependency; fail loudly only when actually used.
     import boto3

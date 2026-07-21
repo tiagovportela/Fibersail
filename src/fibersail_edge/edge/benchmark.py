@@ -26,11 +26,11 @@ from __future__ import annotations
 import argparse
 import itertools
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from .processor import EdgeProcessor, ProcessorConfig
 from ..sensor import DampedOscillatorSensor, FaultConfig, SensorConfig
 from ..sources import Sample, SampleSource
+from .processor import EdgeProcessor, ProcessorConfig
 
 
 def make_samples(n: int, config: Optional[SensorConfig] = None) -> List[Sample]:
@@ -39,7 +39,7 @@ def make_samples(n: int, config: Optional[SensorConfig] = None) -> List[Sample]:
     return list(itertools.islice(sensor.stream(), n))
 
 
-def bench_processor_isolated(samples: List[Sample], config: ProcessorConfig) -> Dict[str, float]:
+def bench_processor_isolated(samples: List[Sample], config: ProcessorConfig) -> Dict[str, Any]:
     """Time only the ``process()`` loop over pre-materialized samples."""
     proc = EdgeProcessor(config)
     n = len(samples)
@@ -52,7 +52,7 @@ def bench_processor_isolated(samples: List[Sample], config: ProcessorConfig) -> 
     return _summarize("isolated", n, frames, elapsed, config.sample_rate_hz)
 
 
-def bench_end_to_end(source: SampleSource, n: int, config: ProcessorConfig) -> Dict[str, float]:
+def bench_end_to_end(source: SampleSource, n: int, config: ProcessorConfig) -> Dict[str, Any]:
     """Time sensor synthesis + processing together over ``n`` samples."""
     proc = EdgeProcessor(config)
     frames = 0
@@ -66,7 +66,7 @@ def bench_end_to_end(source: SampleSource, n: int, config: ProcessorConfig) -> D
     return _summarize("end-to-end", seen, frames, elapsed, config.sample_rate_hz)
 
 
-def _summarize(name: str, n: int, frames: int, elapsed: float, fs: float) -> Dict[str, float]:
+def _summarize(name: str, n: int, frames: int, elapsed: float, fs: float) -> Dict[str, Any]:
     rate = n / elapsed if elapsed > 0 else float("inf")
     return {
         "name": name,
@@ -79,7 +79,7 @@ def _summarize(name: str, n: int, frames: int, elapsed: float, fs: float) -> Dic
     }
 
 
-def _print_row(r: Dict[str, float]) -> None:
+def _print_row(r: Dict[str, Any]) -> None:
     print(
         f"  {r['name']:<11s} "
         f"{int(r['samples']):>9d} samples  "

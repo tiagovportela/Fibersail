@@ -20,11 +20,11 @@ import random
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Tuple
 
+from ..sources import SampleSource
 from .adaptive import EwmaConfig, EwmaDetector, KalmanConfig, KalmanDetector
 from .detector import BaselineZScoreDetector, Detector, DetectorConfig
 from .evaluation import EvaluationReport, evaluate
 from .processor import EdgeProcessor, ProcessorConfig
-from ..sources import SampleSource
 
 
 def build_detectors(
