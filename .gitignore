@@ -26,3 +26,7 @@ htmlcov/
 *.swp
 .idea/
 .vscode/
+
+# Cloud-sync durable spool (Part 3 demo/local buffering)
+*.spool/
+.fibersail_spool/

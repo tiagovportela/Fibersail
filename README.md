@@ -2,9 +2,9 @@
 
 A small, realistic slice of an industrial equipment-health pipeline: a synthetic
 vibration sensor (physics) → a streaming edge processor → a durable cloud sync
-layer. This repository implements **Part 1 — the simulated sensor** and **Part 2
-— the edge processing service**, structured so Part 3 (cloud sync) drops in on top
-of them without rework.
+layer. This repository implements all three parts — **Part 1** the simulated
+sensor, **Part 2** the edge processing service, and **Part 3** the durable cloud
+sync — each decoupled behind a small protocol so the next drops in without rework.
 
 > Full brief: [`take_home_exercise/take_home_exercise.md`](take_home_exercise/take_home_exercise.md).
 
@@ -16,7 +16,7 @@ of them without rework.
 |------|-------|--------|
 | **1** | Simulated sensor — damped harmonic oscillator, streamed, injectable fault | ✅ implemented |
 | **2** | Edge processing — bounded ring buffer, RMS/std/dominant-freq, anomaly detection, ≥1 kHz | ✅ implemented |
-| 3 | Cloud sync — batch + compress, durable file queue, LocalStack S3, backoff | ⏳ next |
+| **3** | Cloud sync — batch + compress, durable file queue, retry/backoff, mock S3 | ✅ implemented |
 
 ---
 
@@ -39,15 +39,25 @@ src/fibersail_edge/
     processor.py     #   ProcessorConfig, EdgeProcessor (ties it together)
     evaluation.py    #   precision/recall, guard-band + latency, evaluate()
     benchmark.py     #   throughput harness (python -m fibersail_edge.edge.benchmark)
+  cloud/             # ── Part 3 — cloud sync ──
+    serialization.py #   BatchHeader, NDJSON+gzip codec, S3 key layout
+    durable_queue.py #   DurableQueue — crash-safe, restart-recoverable file FIFO
+    backoff.py       #   exponential backoff with jitter
+    uploader.py      #   Uploader protocol + InMemory/Flaky doubles
+    sink.py          #   DurableCloudSink (implements FrameSink)
+    s3.py            #   boto3 S3 transport (the ONLY boto3 importer)
+    __main__.py      #   end-to-end demo (python -m fibersail_edge.cloud)
 tests/
   test_sensor.py / test_sources.py                 # Part 1
   test_ring_buffer.py test_features.py test_detector.py test_processor.py
   test_evaluation.py test_throughput.py test_sink.py   # Part 2
+  test_cloud_serialization.py test_durable_queue.py test_backoff.py test_uploader.py
+  test_cloud_sink.py test_cloud_s3.py test_cloud_restart_subprocess.py   # Part 3
 notebooks/
   01_sensor_exploration.ipynb   # Part 1 — signal viz + consistency (pre-executed)
   02_edge_processing.ipynb      # Part 2 — features, detection, throughput (pre-executed)
 take_home_exercise/             # the provided brief + sample_dataset_small.csv
-pyproject.toml                  # PEP 621 project; uv_build backend; viz extra + dev group
+pyproject.toml                  # PEP 621; uv_build backend; viz + cloud extras + dev group
 uv.lock                         # pinned, reproducible resolution (committed)
 .python-version                 # interpreter pin (3.13)
 ```
@@ -55,7 +65,9 @@ uv.lock                         # pinned, reproducible resolution (committed)
 The whole public API is re-exported from the top level, so `from fibersail_edge
 import EdgeProcessor` works regardless of layout; `from fibersail_edge.edge import
 …` / `from fibersail_edge.sensor import …` are available for callers that prefer to
-name the layer. Part 3 will add a sibling `cloud/` subpackage.
+name the layer. The `cloud` subpackage is imported explicitly
+(`from fibersail_edge.cloud import DurableCloudSink`) and is **not** re-exported at
+the top level, so `import fibersail_edge` stays numpy-only (no boto3).
 
 Standard **src layout** built with uv's native **`uv_build`** backend.
 
@@ -115,10 +127,15 @@ Run the code and tests through the uv environment (`uv run <cmd>` executes insid
 
 ```bash
 uv run python -c "import fibersail_edge; print(fibersail_edge.__version__)"
-uv run pytest                       # 66 tests, ~6 s
+uv run pytest                       # 103 tests, ~10 s
 uv run python -m fibersail_edge     # Part 2: run the pipeline + print the eval summary
 uv run python -m fibersail_edge.edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
+uv run python -m fibersail_edge.cloud            # Part 3: cloud sync demo (mock S3 via moto)
 ```
+
+`uv sync` installs the `dev` group, which includes `moto` — so the cloud tests and
+the demo run out of the box. For a production edge build that needs the real boto3
+S3 client (but not moto), install the opt-in extra: `uv sync --extra cloud`.
 
 Feed the sensor stream through the edge processor and read off feature frames:
 
@@ -357,6 +374,120 @@ loop can never block on S3.
 
 ---
 
+## Part 3 — Cloud sync
+
+Batches + compresses feature frames, buffers them **durably on local disk** so
+nothing is lost across a process restart, and uploads them to S3 with retry/backoff
+under intermittent connectivity — **without the edge loop ever blocking on S3**.
+
+```
+EdgeProcessor ─▶ DurableCloudSink.emit  (O(1), non-blocking, drop-newest if full)
+                     │  [batcher thread]  batch → NDJSON+gzip → fsync
+                     ▼
+                  DurableQueue (disk spool)  ──[uploader thread]──▶ Uploader ─▶ S3
+                   crash-safe, FIFO             peek→upload→ack           (moto |
+                                                retry w/ backoff           LocalStack |
+                                                                           real AWS)
+```
+
+### Delivery guarantee & idempotency
+
+Delivery is **at-least-once**: `peek → upload → ack(delete)`. The one unavoidable
+duplicate — a crash between a successful upload and its ack — is made *harmless* by
+two properties working together: the S3 object key is a **pure function of the
+batch's persisted identity** (`session_id` + `batch_seq`, frozen into the batch
+bytes at creation), and the serialized body is **byte-identical** (`gzip` with
+`mtime=0`). So a retried upload writes the *same* key with the *same* bytes — an
+idempotent overwrite, never a duplicate. A fresh `session_id` per process keeps
+recovered batches from an old run from ever clobbering a new run's objects.
+
+### Durable queue — crash-safe by construction
+
+`DurableQueue` is one file per batch in a spool dir. Enqueue is atomic and durable:
+write `<seq>.batch.tmp` → `fsync(file)` → `os.replace()` (atomic on POSIX/Windows) →
+`fsync(dir)`. A crash therefore never leaves a half-written batch visible, and a
+committed batch survives power loss. On construction it recovers: orphan `*.tmp`
+files (writes that never published) are deleted, committed batches are the queue,
+and the next sequence continues from `max(seq)+1` — no counter file to disagree with
+the spool. `tests/test_durable_queue.py::test_survives_restart_recovers_in_fifo_order`
+and a hard-crash (`os._exit`) subprocess test prove recovery rides on `fsync`, not on
+any clean-shutdown hook.
+
+### Serialization & compression — NDJSON + gzip
+
+Chosen because it adds **zero runtime dependencies** (`json` + `gzip` are stdlib) —
+the only new runtime dep in all of Part 3 is `boto3`, for transport — while staying
+human-inspectable (`aws s3 cp … - | gunzip | head`), streamable, and Athena/Glue
+queryable. Line 0 is a self-describing header; lines 1..N are one `FeatureFrame`
+each. Non-finite floats serialize to `null` (never invalid `NaN`/`Infinity`), and
+the Part 2 `bool()` cast on `is_anomaly` is what keeps `numpy.bool_` from breaking
+JSON. Measured compression on float-heavy telemetry is **~2.9×** (larger batches
+compress better; Parquet is the natural *downstream* format — see "at scale" below —
+but pyarrow on the edge would dwarf every other dependency, so we land compact
+NDJSON.gz and convert downstream where CPU is cheap).
+
+### S3 object layout (and why)
+
+```
+telemetry/v1/sensor_id=<id>/date=YYYY-MM-DD/hour=HH/part-<session>-<seq:08d>.ndjson.gz
+```
+
+| Property | How the layout delivers it |
+|----------|----------------------------|
+| Time-range queries | `date=`/`hour=` Hive partitions → Athena partition pruning; cheap prefix listing |
+| Per-device isolation | leading `sensor_id=` → per-device lifecycle/retention + IAM prefix scoping |
+| No hot prefixes | high-cardinality `sensor_id` first spreads writes (S3 scales per prefix) |
+| Idempotent writes | `(session_id, batch_seq)` filename is deterministic → retry overwrites, no dup |
+| Layout vs record evolution | `v1` prefix = layout generation; envelope `schema_version` = record schema |
+
+**Timestamp caveat (called out honestly):** a `FeatureFrame`'s `t` is stream-relative
+and resets every run, so it can't globally bucket batches. Partitioning uses the
+edge **wall-clock at batch close** (`created_at_utc`), with `session_id` + `batch_seq`
+for restart-safe ordering. A real deployment would add a per-frame ingest/device
+timestamp; the batch-close wall-clock is the honest stand-in here.
+
+### Non-blocking, bounded-memory sink
+
+`emit()` is O(1): it drops the frame onto a bounded in-memory `queue.Queue`
+(`put_nowait`; on overflow it drops the newest and counts it — the sole backpressure
+valve). A **batcher thread** accumulates to `batch_max_frames` or `batch_max_seconds`
+(monotonic clock, so NTP steps can't stall it), serializes, and spools durably. An
+**uploader thread** drains the spool with exponential backoff + jitter; a transient
+error leaves the batch on disk to retry, a permanent one is dead-lettered so it can't
+block the queue head. `close()` flushes the final partial batch, then drains
+(bounded by a timeout). Sink RAM is `O(queue_maxsize + batch_max_frames + one batch)`
+— **independent of outage length or spool depth** (the durable buffer lives on disk),
+verified by a `tracemalloc` backpressure test.
+
+### Mock S3 — moto (tests + demo), LocalStack/AWS via `endpoint_url`
+
+The automated suite uses **moto** (`mock_aws`): in-process, no Docker, deterministic,
+CI-friendly. `S3Config.endpoint_url` is the single seam that lets the *identical*
+`S3Uploader` code target moto (no endpoint), a LocalStack container
+(`http://localhost:4566`), or real AWS — only the config changes. `boto3` is imported
+**only** in `cloud/s3.py`, so the durable queue, batching, backoff, and sink are all
+testable (and importable) without the cloud extra.
+
+### Run it
+
+```bash
+uv run python -m fibersail_edge.cloud --outage-start-s 0 --outage-duration-s 2
+```
+
+emits ~286 feature frames through a simulated 2 s outage and prints, e.g.:
+
+```
+  simulated upload failures : 7
+  batches enqueued / uploaded: 6 / 6
+  objects in S3             : 6
+  example key               : telemetry/v1/sensor_id=press-042/date=…/hour=…/part-…-00000000.ndjson.gz
+  frames emitted            : 286
+  frames in S3              : 286   ✓ no loss
+  bytes gz / raw            : 20,644 / 59,140   (compression 2.86x)
+```
+
+---
+
 ## Key design decisions & trade-offs
 
 - **One streaming contract, many sources.** `SampleSource` (a `Protocol`) is the
@@ -376,6 +507,12 @@ loop can never block on S3.
   keeping features causal.
 - **Pluggable detector behind a `Protocol`.** One baseline z-score detector ships;
   the seam lets an EWMA/Kalman variant drop in without touching the processor.
+- **At-least-once + idempotent keys (Part 3)** over exactly-once: exactly-once to S3
+  needs distributed transactions; a deterministic key + byte-identical body makes the
+  lone crash-window duplicate a harmless overwrite instead.
+- **boto3 isolated to one module (Part 3).** The durable queue, batching, backoff,
+  and sink are pure stdlib, so the correctness-critical core is testable with no
+  cloud extra and no Docker; only `cloud/s3.py` needs boto3.
 
 ## What I'd change with more time
 
@@ -391,16 +528,68 @@ loop can never block on S3.
   and a **PR curve** by sweeping the detector score threshold.
 - **Multi-sensor fusion** (2–3 correlated sensors) and property-based tests
   (Hypothesis) over parameter ranges.
+- **Part 3:** a `dead_letter/` spool (forensics over silent drop) for poison batches;
+  a per-frame ingest timestamp; downstream Parquet conversion; and a real LocalStack
+  end-to-end CI job alongside the moto unit tests.
 
 ---
 
-## Roadmap — Part 3
+## From prototype to production edge deployment
 
-- **Part 3 (cloud sync):** batch + compress the feature frames emitted through the
-  `FrameSink` seam; a durable file-backed queue that survives a process restart;
-  LocalStack-mocked S3 with simulated intermittent connectivity and
-  retry-with-backoff; a justified S3 object layout. A separate uploader thread
-  drains the sink so the edge loop never blocks on S3 availability.
+How this slice would actually get deployed and operated on real edge hardware
+talking to AWS:
 
-A "From prototype to production edge deployment" section (edge runtime/OTA/
-observability/sizing) will accompany the full submission.
+- **Runtime / orchestration — bare `systemd` first, AWS IoT Greengrass when fleet
+  ops dominate.** A `systemd` unit (`Restart=always`, `MemoryMax`/`CPUQuota` cgroup
+  limits, `WatchdogSec`) is the lean, dependency-light default for a small
+  homogeneous fleet — it just runs the packaged CLI. Greengrass v2 buys managed
+  component deploys, OTA, local pub/sub, fleet provisioning, and IoT-Core-issued
+  short-lived credentials (via a role alias) with offline spooling — at the cost of
+  a heavier Nucleus runtime and tighter AWS coupling. The package supports both
+  unchanged: a plain entry point for `systemd`'s `ExecStart`, and config-driven
+  `endpoint_url`/credentials that Greengrass can inject.
+
+- **OTA updates.** Ship the versioned, `uv.lock`-pinned wheel as a Greengrass
+  component version (or a signed apt/OCI artifact) onto an A/B partition with a
+  post-install health check and automatic rollback. The `telemetry/v1` layout
+  prefix, the envelope `schema_version`, and versioned config let new and old
+  firmware **coexist during a phased rollout** — a half-updated fleet writes objects
+  both readers understand.
+
+- **Observability under constrained connectivity.** Emit structured JSON logs to a
+  bounded local ring buffer; ship metrics through the *same* durable-queue pattern
+  to CloudWatch (EMF) / IoT Core when a link is up. Surface **queue depth**,
+  **disk-spill high-water**, **dropped-frame count**, and **time-since-last-successful
+  sync**, and alert on that last one **cloud-side as a dead-man's switch** — an
+  offline device can't raise its own alarm, so absence-of-heartbeat is the signal.
+  Rate-limit anomaly events so a fault storm can't saturate a thin uplink.
+
+- **Sizing throughput & memory for real hardware.** The laptop `benchmark.py` number
+  (~400× headroom) is a *ceiling*, not a spec. Re-run it on the target SoC under the
+  same cgroup limits as deployment, pin the interpreter, and set
+  `OMP/OPENBLAS_NUM_THREADS=1` for predictable single-core timing. Size the disk
+  buffer from the outage budget: `buffer_bytes ≈ compressed_batch_size ×
+  (max_outage_seconds / batch_period_seconds)` — e.g. a 6-hour outage at one ~3.4 KB
+  batch / 5 s ≈ ~15 MB, trivially bounded by the queue's `max_bytes` cap. Verify the
+  flat memory curve with `tracemalloc`/RSS over a multi-day soak (leaks, fragmentation).
+
+### Optional: a one-page sketch for AWS ingestion at scale
+
+Batched S3 (what this repo does) is cheap, simple, and durable, at the cost of
+minutes-scale latency — the right default for equipment-health telemetry. If some
+signals need near-real-time reaction, the fuller path would be:
+
+```
+device ──(MQTT / presigned S3 PUT)──▶ S3 raw (this NDJSON.gz Hive layout)
+                                         │  S3 event
+                                         ▼
+                         Firehose / Glue  ──compact + convert──▶ S3 Parquet (same partitions)
+                                                                   │
+                                                                   ▼  Athena / Redshift Spectrum
+      hot path (optional): Kinesis ──▶ Flink ──▶ Timestream + alerting (S3 stays the cold store)
+```
+
+The edge deliberately lands compact NDJSON.gz and lets a downstream job convert to
+columnar Parquet where CPU is cheap; the Hive partition scheme above is chosen so
+that conversion is drop-in. Batched-S3 vs streaming is a latency/cost trade-off, not
+a correctness one — both keep S3 as the durable system of record.
