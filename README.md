@@ -22,19 +22,23 @@ of them without rework.
 
 ## Repository layout
 
+The package is organized by exercise part, over one shared streaming contract:
+
 ```
 src/fibersail_edge/
-  sources.py       # Sample, SampleSource protocol, CsvReplaySource        (Part 1)
-  sensor.py        # SensorConfig, FaultConfig, DampedOscillatorSensor      (Part 1)
-  ring_buffer.py   # RingBuffer — preallocated numpy circular buffer        (Part 2)
-  features.py      # FeatureFrame, FeatureExtractor (RMS/std/dominant freq) (Part 2)
-  detector.py      # Detector protocol, BaselineZScoreDetector              (Part 2)
-  sink.py          # FrameSink seam (ListSink/CallbackSink) → Part 3        (Part 2)
-  processor.py     # ProcessorConfig, EdgeProcessor (ties it together)      (Part 2)
-  evaluation.py    # precision/recall, guard-band + latency, evaluate()     (Part 2)
-  benchmark.py     # throughput harness   (python -m fibersail_edge.benchmark)
-  __main__.py      # end-to-end demo + eval (python -m fibersail_edge)
-  py.typed         # PEP 561 typing marker
+  sources.py         # Sample, SampleSource protocol, CsvReplaySource   (shared contract)
+  __main__.py        # end-to-end demo + eval   (python -m fibersail_edge)
+  py.typed           # PEP 561 typing marker
+  sensor/            # ── Part 1 — synthetic sensor ──
+    oscillator.py    #   SensorConfig, FaultConfig, DampedOscillatorSensor
+  edge/              # ── Part 2 — edge processing ──
+    ring_buffer.py   #   RingBuffer — preallocated numpy circular buffer
+    features.py      #   FeatureFrame, FeatureExtractor (RMS/std/dominant freq)
+    detector.py      #   Detector protocol, BaselineZScoreDetector
+    sink.py          #   FrameSink seam (ListSink/CallbackSink) → Part 3
+    processor.py     #   ProcessorConfig, EdgeProcessor (ties it together)
+    evaluation.py    #   precision/recall, guard-band + latency, evaluate()
+    benchmark.py     #   throughput harness (python -m fibersail_edge.edge.benchmark)
 tests/
   test_sensor.py / test_sources.py                 # Part 1
   test_ring_buffer.py test_features.py test_detector.py test_processor.py
@@ -47,6 +51,11 @@ pyproject.toml                  # PEP 621 project; uv_build backend; viz extra +
 uv.lock                         # pinned, reproducible resolution (committed)
 .python-version                 # interpreter pin (3.13)
 ```
+
+The whole public API is re-exported from the top level, so `from fibersail_edge
+import EdgeProcessor` works regardless of layout; `from fibersail_edge.edge import
+…` / `from fibersail_edge.sensor import …` are available for callers that prefer to
+name the layer. Part 3 will add a sibling `cloud/` subpackage.
 
 Standard **src layout** built with uv's native **`uv_build`** backend.
 
@@ -108,7 +117,7 @@ Run the code and tests through the uv environment (`uv run <cmd>` executes insid
 uv run python -c "import fibersail_edge; print(fibersail_edge.__version__)"
 uv run pytest                       # 66 tests, ~6 s
 uv run python -m fibersail_edge     # Part 2: run the pipeline + print the eval summary
-uv run python -m fibersail_edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
+uv run python -m fibersail_edge.edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
 ```
 
 Feed the sensor stream through the edge processor and read off feature frames:
@@ -316,7 +325,7 @@ still faulty right after it ends → false positives).
 ### Throughput — ≥1000 samples/s single-core
 
 The per-sample cost is one ring-buffer write; the FFT runs only 10×/s. Measured on
-a laptop (`python -m fibersail_edge.benchmark`, single core):
+a laptop (`python -m fibersail_edge.edge.benchmark`, single core):
 
 | measurement | samples/s | × real-time |
 |-------------|-----------|-------------|

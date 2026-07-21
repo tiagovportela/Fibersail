@@ -7,9 +7,12 @@ Run with ``-s`` to see the measured rates:
 
 from __future__ import annotations
 
-from fibersail_edge.benchmark import bench_end_to_end, bench_processor_isolated, make_samples
-from fibersail_edge.processor import ProcessorConfig
-from fibersail_edge.sensor import DampedOscillatorSensor, SensorConfig
+from fibersail_edge import DampedOscillatorSensor, ProcessorConfig, SensorConfig
+from fibersail_edge.edge.benchmark import (
+    bench_end_to_end,
+    bench_processor_isolated,
+    make_samples,
+)
 
 TARGET_SAMPLES_PER_S = 1000.0
 

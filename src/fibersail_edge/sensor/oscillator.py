@@ -44,7 +44,7 @@ from typing import Iterator, Optional, Tuple
 
 import numpy as np
 
-from .sources import Sample
+from ..sources import Sample
 
 #: Emittable channels. Acceleration is the default because that is what a real
 #: vibration/accelerometer sensor reports, and a fault shows up in it as both an
