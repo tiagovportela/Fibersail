@@ -83,7 +83,10 @@ path stays lean, and dev tooling (pytest) is a PEP 735 dependency group.
 uv sync --extra viz     # creates .venv, installs core + viz + the default dev group
 ```
 
-- `uv sync` alone installs just the core (numpy) + dev group.
+- `uv sync` alone installs just the core (numpy) + dev group. The dev group
+  includes `moto`, so the cloud tests and the end-to-end demo run out of the box.
+- For a production edge build that needs the real boto3 S3 client (but not moto):
+  `uv sync --extra cloud`.
 - The exact resolution is pinned in `uv.lock`; the interpreter is pinned to 3.13
   by `.python-version`. uv fetches that Python automatically if it's missing.
 - Prefer plain pip? `pip install -e ".[viz]"` still works — it's a standard
@@ -93,6 +96,51 @@ uv sync --extra viz     # creates .venv, installs core + viz + the default dev g
 ---
 
 ## Quickstart
+
+### Run the full pipeline end to end (generator → processor → sync)
+
+One command drives all three parts: the synthetic sensor streams 1 kHz samples with
+an injected fault, the edge processor reduces them to 10 Hz feature frames with
+anomaly flags, and the cloud sink batches + gzips the frames, buffers them durably
+on disk through a **simulated connectivity outage**, uploads them to S3 with
+retry/backoff, then reads every object back and proves nothing was lost:
+
+```bash
+uv sync                                # one-time setup (installs moto — no Docker needed)
+uv run python -m fibersail_edge.cloud  # sensor → EdgeProcessor → DurableCloudSink → mock S3
+```
+
+Expected output ends with a no-loss summary like:
+
+```
+  frames emitted            : 186
+  frames in S3              : 186   ✓ no loss
+  bytes gz / raw            : 12,742 / 37,883   (compression 2.97x)
+```
+
+Useful knobs: `--duration-s`, `--outage-start-s/--outage-duration-s`,
+`--failure-rate`, `--batch-frames`, `--seed` (see `--help`). By default S3 is mocked
+in-process with **moto** (objects vanish when the process exits). To run against a
+**real S3 endpoint** whose objects persist and can be browsed afterwards:
+
+```bash
+docker compose up -d localstack                       # real S3 API server on :4566
+uv run python -m fibersail_edge.cloud --localstack    # same pipeline, real endpoint
+```
+
+The run prints ready-to-paste `aws --endpoint-url=… s3 ls / s3 cp` commands for
+browsing the uploaded batches. Details in [Part 3 — Cloud sync](#part-3--cloud-sync).
+
+### Run each part on its own
+
+```bash
+uv run python -m fibersail_edge     # Parts 1→2: pipeline + honest precision/recall summary
+uv run python -m fibersail_edge.edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
+uv run python -m fibersail_edge.cloud            # Parts 1→2→3: full pipeline (above)
+uv run pytest                       # 103 tests, ~10 s
+```
+
+### Use the library from Python
 
 Generate a stream with an injected fault and pull a few samples:
 
@@ -121,21 +169,6 @@ src = CsvReplaySource("take_home_exercise/sample_dataset_small.csv")
 for sample in itertools.islice(src.stream(), 3):
     print(sample)
 ```
-
-Run the code and tests through the uv environment (`uv run <cmd>` executes inside
-`.venv` without activating it):
-
-```bash
-uv run python -c "import fibersail_edge; print(fibersail_edge.__version__)"
-uv run pytest                       # 103 tests, ~10 s
-uv run python -m fibersail_edge     # Part 2: run the pipeline + print the eval summary
-uv run python -m fibersail_edge.edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
-uv run python -m fibersail_edge.cloud            # Part 3: cloud sync demo (mock S3 via moto)
-```
-
-`uv sync` installs the `dev` group, which includes `moto` — so the cloud tests and
-the demo run out of the box. For a production edge build that needs the real boto3
-S3 client (but not moto), install the opt-in extra: `uv sync --extra cloud`.
 
 Feed the sensor stream through the edge processor and read off feature frames:
 
