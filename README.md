@@ -34,11 +34,13 @@ src/fibersail_edge/
   edge/              # ── Part 2 — edge processing ──
     ring_buffer.py   #   RingBuffer — preallocated numpy circular buffer
     features.py      #   FeatureFrame, FeatureExtractor (RMS/std/dominant freq)
-    detector.py      #   Detector protocol, BaselineZScoreDetector
+    detector.py      #   Detector protocol, BaselineZScoreDetector, shared _Debounce
+    adaptive.py      #   EwmaDetector, KalmanDetector (adaptive-baseline alternatives)
     sink.py          #   FrameSink seam (ListSink/CallbackSink) → Part 3
     processor.py     #   ProcessorConfig, EdgeProcessor (ties it together)
     evaluation.py    #   precision/recall, guard-band + latency, evaluate()
     benchmark.py     #   throughput harness (python -m fibersail_edge.edge.benchmark)
+    compare.py       #   3-detector comparison + drift demo (python -m fibersail_edge.edge.compare)
   cloud/             # ── Part 3 — cloud sync ──
     serialization.py #   BatchHeader, NDJSON+gzip codec, S3 key layout
     durable_queue.py #   DurableQueue — crash-safe, restart-recoverable file FIFO
@@ -50,7 +52,8 @@ src/fibersail_edge/
 tests/
   test_sensor.py / test_sources.py                 # Part 1
   test_ring_buffer.py test_features.py test_detector.py test_processor.py
-  test_evaluation.py test_throughput.py test_sink.py   # Part 2
+  test_evaluation.py test_throughput.py test_sink.py                     # Part 2
+  test_adaptive_detectors.py test_compare.py       # Part 2 — EWMA/Kalman + comparison
   test_cloud_serialization.py test_durable_queue.py test_backoff.py test_uploader.py
   test_cloud_sink.py test_cloud_s3.py test_cloud_restart_subprocess.py   # Part 3
 notebooks/
@@ -136,8 +139,9 @@ browsing the uploaded batches. Details in [Part 3 — Cloud sync](#part-3--cloud
 ```bash
 uv run python -m fibersail_edge     # Parts 1→2: pipeline + honest precision/recall summary
 uv run python -m fibersail_edge.edge.benchmark   # Part 2: throughput table (≥1000 samp/s)
+uv run python -m fibersail_edge.edge.compare     # Part 2: baseline vs EWMA vs Kalman + drift demo
 uv run python -m fibersail_edge.cloud            # Parts 1→2→3: full pipeline (above)
-uv run pytest                       # 103 tests, ~10 s
+uv run pytest                       # 123 tests, ~11 s
 ```
 
 ### Use the library from Python
@@ -339,8 +343,8 @@ flags a frame when *either* monitored feature deviates beyond `k = 4σ`:
   **not** justified from Gaussian tails, and the false-positive rate is validated
   empirically on a healthy stream (`test_no_anomalies_on_healthy_stream`).
 
-`Detector` is a `Protocol`, so an EWMA/Kalman alternative drops in without touching
-the processor (see "What I'd change").
+`Detector` is a `Protocol`, so an alternative drops in without touching the processor
+— two adaptive-baseline variants ship and are compared below.
 
 ### Honest precision / recall against the ground-truth fault
 
@@ -371,6 +375,59 @@ still faulty right after it ends → false positives).
    0.90 s beats the 1.05 s reference — a strong frequency drop trips the threshold
    before the window is even majority-faulty.
 4. **Event detected** — the operational "did we catch it at all".
+
+### Alternative detectors — EWMA & Kalman, compared (stretch goal)
+
+`Detector` is a `Protocol`, so swapping the detection strategy touches nothing else.
+Two adaptive-baseline variants ship alongside the frozen-baseline z-score detector
+(`fibersail_edge.edge.adaptive`):
+
+- **`EwmaDetector`** — an EWMA control chart. The healthy mean/variance are
+  exponentially weighted (smoothing `alpha`, ~`1/alpha` frames of memory); a frame
+  scores by the familiar `z = (x − mean)/std`.
+- **`KalmanDetector`** — a scalar Kalman filter per feature with a random-walk state
+  (each feature is a slowly-varying hidden *level* observed in noise). Its steady
+  state *is* an EWMA, but it scores with the **normalized innovation** `y/√S` (the
+  unit-variance residual) and its knob is the process/measurement-noise ratio `q/r`
+  — the physical analogue of `alpha`.
+
+All three watch the same two features, pass through the **same** Schmitt-trigger
+debounce (factored into a shared `_Debounce`), and use the same `k` — so a comparison
+isolates the one thing that differs: the **baseline model**. Both adaptive detectors
+add **freeze-on-anomaly** — the baseline is updated only from frames that look healthy
+(`|deviation| ≤ k`), so a sustained fault can't be absorbed into the baseline and mask
+itself.
+
+`python -m fibersail_edge.edge.compare` runs all three head to head. On the stationary
+synthetic stream (50→35 Hz fault) they are close — the frozen baseline is a fine model
+when the signal really is stationary:
+
+```
+  detector         event  latency   |      wP    wR   wF1  wFPR   |    rawF1
+  baseline-zscore    YES    0.90s   |   0.853 0.967 0.906 0.047   |    0.688
+  ewma               YES    0.80s   |   0.769 1.000 0.870 0.085   |    0.667
+  kalman             YES    0.90s   |   0.853 0.967 0.906 0.047   |    0.688
+```
+
+Kalman tracks the frozen baseline almost exactly here; EWMA (with `alpha=0.05`) adapts
+a touch faster, trading a hair of precision for slightly earlier onset. The adaptive
+detectors *earn their keep* under **benign baseline drift** — the slow shift a real
+machine shows with temperature/load. The same demo replays a stream that drifts 5 Hz
+across the run with one sharp fault:
+
+```
+  detector          fault caught   drift false-positives
+  baseline-zscore            YES                 176/360
+  ewma                       YES                   4/360
+  kalman                     YES                   4/360
+```
+
+The frozen baseline reads the drift as an anomaly nearly half the time; EWMA and Kalman
+follow the drift and stay quiet, while all three still catch the sharp fault. **Honest
+takeaway:** on a truly stationary signal the simple frozen baseline is preferable (it
+gives up nothing and never chases a real fault); the adaptive detectors are the right
+choice once the healthy operating point moves over hours — the realistic case. The
+comparison and the drift advantage are asserted in `tests/test_compare.py`.
 
 ### Throughput — ≥1000 samples/s single-core
 
@@ -561,8 +618,10 @@ The demo prints these browse commands (with a real key filled in) at the end of 
 - **Decoupled cadence (Part 2).** Per-sample work is O(1) (a ring push); the FFT
   runs only at the hop rate. This is what buys the ~400× throughput headroom while
   keeping features causal.
-- **Pluggable detector behind a `Protocol`.** One baseline z-score detector ships;
-  the seam lets an EWMA/Kalman variant drop in without touching the processor.
+- **Pluggable detector behind a `Protocol`.** Three detectors ship behind one seam —
+  a frozen-baseline z-score plus adaptive EWMA and Kalman variants — with a shared
+  debounce so they compare apples-to-apples; the frozen baseline wins on a stationary
+  signal, the adaptive pair on drift (see the comparison above).
 - **At-least-once + idempotent keys (Part 3)** over exactly-once: exactly-once to S3
   needs distributed transactions; a deterministic key + byte-identical body makes the
   lone crash-window duplicate a harmless overwrite instead.
@@ -577,11 +636,11 @@ The demo prints these browse commands (with a real key filled in) at the end of 
   linear system, useful at high `fs` or stiff parameters.
 - **Multi-channel emission** in one pass (accel + velocity + displacement, plus a
   temperature channel) to mirror the CSV schema more fully.
-- An **EWMA / Kalman detector** (with freeze-on-anomaly so a sustained fault can't
-  drag the adaptive baseline and mask itself) as a second `Detector`, and a
-  quantitative comparison against the baseline z-score version.
 - **Anti-aliased decimation** (`scipy.signal.decimate`) for the 10 Hz telemetry,
   and a **PR curve** by sweeping the detector score threshold.
+- Push the **detector comparison** further: auto-tune `alpha` / `q:r` against a drift
+  budget, add a CUSUM variant for slow ramps, and score the trade-off on a non-
+  stationary synthetic with *both* drift and a fault rather than one at a time.
 - **Multi-sensor fusion** (2–3 correlated sensors) and property-based tests
   (Hypothesis) over parameter ranges.
 - **Part 3:** a `dead_letter/` spool (forensics over silent drop) for poison batches;
