@@ -1,30 +1,39 @@
 """End-to-end cloud-sync demo — ``python -m fibersail_edge.cloud``.
 
-Wires the whole pipeline against a mock S3 (``moto``, in-process — no Docker):
+Wires the whole pipeline:
 
-    sensor(+fault) -> EdgeProcessor -> DurableCloudSink -> [intermittent] S3Uploader -> moto S3
+    sensor(+fault) -> EdgeProcessor -> DurableCloudSink -> [intermittent] S3Uploader -> S3
 
 An outage window (and/or a random failure rate) makes uploads fail, so batches
 buffer durably on disk and drain once connectivity returns. Afterwards the demo
-lists and reads back every S3 object and prints a summary proving **no data loss**
-across the outage, plus the compression ratio.
+reads every object back and prints a summary proving **no data loss**.
 
-    uv run python -m fibersail_edge.cloud
-    uv run python -m fibersail_edge.cloud --outage-start-s 0 --outage-duration-s 2 --failure-rate 0.2
+Two backends, same ``S3Uploader`` code — only ``S3Config.endpoint_url`` changes:
 
-The same ``S3Uploader`` code targets a real S3-compatible endpoint by setting
-``S3Config.endpoint_url`` (e.g. LocalStack ``http://localhost:4566``); the demo
-uses moto so it runs anywhere with no external services.
+* **moto** (default): an in-process mock. Runs anywhere, no Docker — but the
+  objects live only inside this process and vanish when it exits.
+      uv run python -m fibersail_edge.cloud
+
+* **LocalStack / real AWS** (``--localstack`` or ``--endpoint-url``): a real S3 API
+  server over HTTP. Objects **persist** for the life of the service, so you can
+  browse them afterward with the AWS CLI. This is the closest setup to production.
+      docker compose up -d localstack
+      uv run python -m fibersail_edge.cloud --localstack
+
+The identical code path targets real AWS: drop the endpoint and supply real
+credentials/region instead of the dummy ones.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gzip
 import random
 import shutil
 import tempfile
 import time
+from typing import Iterator, Optional
 
 from ..edge import EdgeProcessor
 from ..sensor import DampedOscillatorSensor, FaultConfig, SensorConfig
@@ -33,6 +42,8 @@ from .durable_queue import DurableQueue
 from .serialization import build_object_key, deserialize_batch
 from .sink import DurableCloudSink, SinkConfig
 from .uploader import TransientUploadError, Uploader
+
+_LOCALSTACK_URL = "http://localhost:4566"
 
 
 class _IntermittentUploader:
@@ -64,8 +75,30 @@ class _IntermittentUploader:
         self._inner.upload(key, data)
 
 
+@contextlib.contextmanager
+def _backend(endpoint_url: Optional[str]) -> Iterator[str]:
+    """Enter the chosen S3 backend. Yields a human-readable backend label.
+
+    With no endpoint we start ``moto`` (patches botocore process-wide, so the
+    uploader thread must run inside this context). With an endpoint we use the real
+    boto3 client — no patching, and the objects persist in the target service.
+    """
+    if endpoint_url is None:
+        try:
+            from moto import mock_aws
+        except ImportError:  # pragma: no cover
+            raise SystemExit(
+                "moto is needed for the default in-process backend. Run `uv sync` "
+                "(moto is in the dev group), or use --localstack against a container."
+            )
+        with mock_aws():
+            yield "moto (in-process mock; objects vanish when this process exits)"
+    else:
+        yield f"{endpoint_url} (real S3 endpoint; objects persist)"
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fibersail cloud-sync demo (mock S3 via moto).")
+    parser = argparse.ArgumentParser(description="Fibersail cloud-sync end-to-end demo.")
     parser.add_argument("--duration-s", type=float, default=20.0)
     parser.add_argument("--sensor-id", default="press-042")
     parser.add_argument("--bucket", default="fibersail-telemetry")
@@ -76,24 +109,32 @@ def main() -> None:
     parser.add_argument("--outage-start-s", type=float, default=0.0, help="outage window start (wall-clock s)")
     parser.add_argument("--outage-duration-s", type=float, default=2.0, help="outage window length (s)")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--endpoint-url", default=None,
+                        help="target a real S3 endpoint (e.g. LocalStack) instead of the moto mock")
+    parser.add_argument("--localstack", action="store_true",
+                        help=f"shortcut for --endpoint-url {_LOCALSTACK_URL}")
     args = parser.parse_args()
 
-    try:
-        from moto import mock_aws
-    except ImportError:  # pragma: no cover
-        raise SystemExit(
-            "The demo uses moto for mock S3. Install dev deps with `uv sync` "
-            "(moto is in the dev group)."
-        )
+    endpoint_url = args.endpoint_url or (_LOCALSTACK_URL if args.localstack else None)
 
     from .s3 import S3Config, S3Uploader, ensure_bucket, list_batches, make_client, read_batch
 
+    s3cfg = S3Config(bucket=args.bucket, prefix=args.prefix, region=args.region, endpoint_url=endpoint_url)
     spool = tempfile.mkdtemp(prefix="fibersail-cloud-")
     try:
-        with mock_aws():  # patches botocore process-wide → the uploader thread must run inside this block
-            s3cfg = S3Config(bucket=args.bucket, prefix=args.prefix)
+        with _backend(endpoint_url) as backend_label:
+            print(f"Backend: {backend_label}")
             client = make_client(s3cfg)
-            ensure_bucket(client, s3cfg.bucket, s3cfg.region)
+            try:
+                ensure_bucket(client, s3cfg.bucket, s3cfg.region)
+            except Exception as exc:  # noqa: BLE001 - surface a friendly hint for a down endpoint
+                if endpoint_url is not None:
+                    raise SystemExit(
+                        f"Could not reach S3 at {endpoint_url}: {exc}\n"
+                        f"Is LocalStack running?  docker compose up -d localstack"
+                    )
+                raise
 
             uploader = _IntermittentUploader(
                 S3Uploader(s3cfg, client=client),
@@ -110,7 +151,6 @@ def main() -> None:
                     sensor_id=args.sensor_id,
                     batch_max_frames=args.batch_frames,
                     batch_max_seconds=args.batch_seconds,
-                    # Snappy backoff so the demo recovers quickly after the outage.
                     backoff=BackoffConfig(base_s=0.2, factor=2.0, max_s=2.0),
                 ),
             )
@@ -134,12 +174,11 @@ def main() -> None:
             for frame in processor.process_stream(sensor):
                 sink.emit(frame)
                 frames_emitted += 1
-            sink.close(drain=True, timeout=30.0)  # block until the spool drains (outage ends → retries succeed)
+            sink.close(drain=True, timeout=30.0)
 
-            # --- verify: read every uploaded object back and count frames ---
             objects = list_batches(client, s3cfg.bucket, s3cfg.prefix)
             frames_in_s3 = raw_bytes = gz_bytes = 0
-            for key, size in objects:
+            for key, _size in objects:
                 blob = read_batch(client, s3cfg.bucket, key)
                 gz_bytes += len(blob)
                 raw_bytes += len(gzip.decompress(blob))
@@ -159,6 +198,14 @@ def main() -> None:
             print(f"  dropped (backpressure)    : {sink.dropped_frames}")
             print(f"  bytes gz / raw            : {gz_bytes:,} / {raw_bytes:,}   "
                   f"(compression {ratio:.2f}x)")
+
+            if endpoint_url is not None:
+                print("\nObjects persist — browse them (dummy creds work for LocalStack):")
+                print(f"  export AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing")
+                print(f"  aws --endpoint-url={endpoint_url} s3 ls s3://{args.bucket}/{args.prefix}/ --recursive")
+                if objects:
+                    print(f"  aws --endpoint-url={endpoint_url} s3 cp "
+                          f"s3://{args.bucket}/{objects[0][0]} - | gunzip | head")
     finally:
         shutil.rmtree(spool, ignore_errors=True)
 

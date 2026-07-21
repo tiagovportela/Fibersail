@@ -1,0 +1,18 @@
+# LocalStack — a real S3 API server for a production-faithful cloud-sync demo.
+#
+#   docker compose up -d localstack
+#   uv run python -m fibersail_edge.cloud --localstack
+#   aws --endpoint-url=http://localhost:4566 s3 ls s3://fibersail-telemetry/ --recursive
+#   docker compose down
+#
+# Only S3 is enabled. Objects live for the life of the container (add
+# PERSISTENCE=1 + a volume to survive restarts). The demo also runs with no
+# container at all against the default in-process moto mock.
+services:
+  localstack:
+    image: localstack/localstack:3
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - DEBUG=0

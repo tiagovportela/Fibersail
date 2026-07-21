@@ -459,16 +459,22 @@ block the queue head. `close()` flushes the final partial batch, then drains
 — **independent of outage length or spool depth** (the durable buffer lives on disk),
 verified by a `tracemalloc` backpressure test.
 
-### Mock S3 — moto (tests + demo), LocalStack/AWS via `endpoint_url`
+### Backends — moto (default) and LocalStack, via one `endpoint_url` seam
 
-The automated suite uses **moto** (`mock_aws`): in-process, no Docker, deterministic,
-CI-friendly. `S3Config.endpoint_url` is the single seam that lets the *identical*
-`S3Uploader` code target moto (no endpoint), a LocalStack container
-(`http://localhost:4566`), or real AWS — only the config changes. `boto3` is imported
-**only** in `cloud/s3.py`, so the durable queue, batching, backoff, and sink are all
-testable (and importable) without the cloud extra.
+`S3Config.endpoint_url` is the single knob that lets the *identical* `S3Uploader`
+code target three backends — only the config changes, and `boto3` is imported
+**only** in `cloud/s3.py`:
 
-### Run it
+- **moto** (default, no endpoint): an in-process mock — no Docker, deterministic,
+  CI-friendly. The whole automated suite uses it (`mock_aws`). The catch: objects
+  live inside the process and vanish when it exits.
+- **LocalStack** (`--localstack`): a real S3 API server in a container — the
+  closest setup to production. Objects **persist** for the life of the container,
+  so you can browse them with the AWS CLI after the run.
+- **real AWS**: same code, no endpoint, real credentials/region instead of the
+  dummy ones.
+
+### Run it — moto (zero setup)
 
 ```bash
 uv run python -m fibersail_edge.cloud --outage-start-s 0 --outage-duration-s 2
@@ -477,6 +483,7 @@ uv run python -m fibersail_edge.cloud --outage-start-s 0 --outage-duration-s 2
 emits ~286 feature frames through a simulated 2 s outage and prints, e.g.:
 
 ```
+Backend: moto (in-process mock; objects vanish when this process exits)
   simulated upload failures : 7
   batches enqueued / uploaded: 6 / 6
   objects in S3             : 6
@@ -485,6 +492,22 @@ emits ~286 feature frames through a simulated 2 s outage and prints, e.g.:
   frames in S3              : 286   ✓ no loss
   bytes gz / raw            : 20,644 / 59,140   (compression 2.86x)
 ```
+
+### Run it — LocalStack (production-faithful; browse the real objects)
+
+```bash
+docker compose up -d localstack                       # real S3 server on :4566
+uv run python -m fibersail_edge.cloud --localstack    # same pipeline, real endpoint
+
+# the objects are really there — browse them (dummy creds are fine for LocalStack):
+export AWS_ACCESS_KEY_ID=testing AWS_SECRET_ACCESS_KEY=testing
+aws --endpoint-url=http://localhost:4566 s3 ls s3://fibersail-telemetry/ --recursive
+aws --endpoint-url=http://localhost:4566 s3 cp s3://fibersail-telemetry/<key> - | gunzip | head
+docker compose down
+```
+
+The demo prints these browse commands (with a real key filled in) at the end of a
+`--localstack` run. `--endpoint-url <url>` targets any other S3-compatible endpoint.
 
 ---
 
