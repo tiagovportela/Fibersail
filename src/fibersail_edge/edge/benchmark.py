@@ -29,8 +29,8 @@ import time
 from typing import Dict, List, Optional
 
 from .processor import EdgeProcessor, ProcessorConfig
-from .sensor import DampedOscillatorSensor, FaultConfig, SensorConfig
-from .sources import Sample, SampleSource
+from ..sensor import DampedOscillatorSensor, FaultConfig, SensorConfig
+from ..sources import Sample, SampleSource
 
 
 def make_samples(n: int, config: Optional[SensorConfig] = None) -> List[Sample]:

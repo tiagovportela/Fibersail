@@ -2,7 +2,7 @@
 
 Why a sink, not just an iterator
 --------------------------------
-:meth:`EdgeProcessor.process_stream <fibersail_edge.processor.EdgeProcessor.process_stream>`
+:meth:`EdgeProcessor.process_stream <fibersail_edge.edge.processor.EdgeProcessor.process_stream>`
 already yields frames lazily, which is enough for tests and simple in-process use.
 But a lazy iterator does **not**, on its own, satisfy the brief's "the edge
 processor shouldn't block on S3": if the consumer does blocking network I/O inline

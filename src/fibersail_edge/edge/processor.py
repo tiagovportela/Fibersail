@@ -1,14 +1,14 @@
 """The edge processing service — the streaming heart of Part 2.
 
 :class:`EdgeProcessor` consumes a :class:`~fibersail_edge.sources.SampleSource`
-one sample at a time and emits :class:`~fibersail_edge.features.FeatureFrame`\\ s
+one sample at a time and emits :class:`~fibersail_edge.edge.features.FeatureFrame`\\ s
 at a fixed *hop* cadence. It ties together the three primitives:
 
     sample --> RingBuffer (bounded window) --> FeatureExtractor --> Detector --> FeatureFrame
 
 Design points (expanded in the README):
 
-* **Bounded, causal window.** A :class:`~fibersail_edge.ring_buffer.RingBuffer`
+* **Bounded, causal window.** A :class:`~fibersail_edge.edge.ring_buffer.RingBuffer`
   of ``window_samples`` holds the most recent ``window_s`` seconds — a *trailing*
   window ``[t - window_s, t]`` with no look-ahead. Nothing is emitted until the
   buffer first fills (a ~``window_s`` silent start, well before any injected
@@ -18,7 +18,7 @@ Design points (expanded in the README):
   ``hop_s = 0.1`` that is 10 frames/s regardless of the 1 kHz input — and those
   10 Hz frames double as the decimated telemetry Part 3 uploads.
 * **Non-blocking output.** :meth:`process_stream` yields lazily; :meth:`run`
-  pushes to a :class:`~fibersail_edge.sink.FrameSink`. The processor imports
+  pushes to a :class:`~fibersail_edge.edge.sink.FrameSink`. The processor imports
   nothing from the cloud layer — dependency flow is one-way, so it can never
   block on S3.
 """
@@ -32,7 +32,7 @@ from .detector import BaselineZScoreDetector, Detector, DetectorConfig
 from .features import FeatureExtractor, FeatureFrame
 from .ring_buffer import RingBuffer
 from .sink import FrameSink
-from .sources import Sample, SampleSource
+from ..sources import Sample, SampleSource
 
 
 @dataclass(frozen=True)
@@ -108,8 +108,8 @@ class EdgeProcessor:
 
         Args:
             config: Windowing / feature configuration.
-            detector: Any object satisfying the :class:`~fibersail_edge.detector.Detector`
-                protocol. Defaults to a :class:`~fibersail_edge.detector.BaselineZScoreDetector`
+            detector: Any object satisfying the :class:`~fibersail_edge.edge.detector.Detector`
+                protocol. Defaults to a :class:`~fibersail_edge.edge.detector.BaselineZScoreDetector`
                 built from ``config.detector``. Inject your own to swap the detection
                 strategy (e.g. an EWMA/Kalman variant) without changing the processor;
                 when a detector is injected, ``config.detector`` is unused.

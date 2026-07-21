@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 from .processor import EdgeProcessor
-from .sources import SampleSource
+from ..sources import SampleSource
 
 
 class _Confusion:

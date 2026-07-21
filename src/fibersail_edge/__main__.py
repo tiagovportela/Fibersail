@@ -4,18 +4,16 @@
     uv run python -m fibersail_edge --k 3.5 --window-s 2.0 --duration-s 20
 
 Builds a :class:`~fibersail_edge.sensor.DampedOscillatorSensor` with an injected
-fault, runs it through the :class:`~fibersail_edge.processor.EdgeProcessor`, and
+fault, runs it through the :class:`~fibersail_edge.edge.processor.EdgeProcessor`, and
 prints the honest precision/recall report from
-:func:`~fibersail_edge.evaluation.evaluate`.
+:func:`~fibersail_edge.edge.evaluation.evaluate`.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from .detector import DetectorConfig
-from .evaluation import evaluate
-from .processor import EdgeProcessor, ProcessorConfig
+from .edge import DetectorConfig, EdgeProcessor, ProcessorConfig, evaluate
 from .sensor import DampedOscillatorSensor, FaultConfig, SensorConfig
 
 
